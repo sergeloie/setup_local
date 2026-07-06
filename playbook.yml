@@ -169,25 +169,26 @@
         dest: "/tmp/openide.tar.gz"
         mode: "0644"
 
-    - name: Распаковать OpenIDE в {{ opt_dir }}/openide
+    - name: Распаковать OpenIDE
       ansible.builtin.unarchive:
         src: "/tmp/openide.tar.gz"
         dest: "{{ opt_dir }}"
         remote_src: true
-        creates: "{{ opt_dir }}/openide"
+        creates: "{{ opt_dir }}/openIDE-{{ openide_build }}"
       register: openide_extract
 
-    - name: Найти реальную папку после распаковки (openIDE-*)
+    - name: Найти распакованную папку OpenIDE
       ansible.builtin.shell: "ls -d {{ opt_dir }}/openIDE-* 2>/dev/null | head -n1"
       register: openide_dir_found
       changed_when: false
       failed_when: false
 
-    - name: Переименовать в {{ opt_dir }}/openide (если ещё не переименовано)
-      ansible.builtin.command: "mv {{ openide_dir_found.stdout }} {{ opt_dir }}/openide"
+    - name: Переименовать в {{ opt_dir }}/openide
+      ansible.builtin.command: "mv -f {{ openide_dir_found.stdout }} {{ opt_dir }}/openide"
       when:
         - openide_dir_found.stdout is defined
         - openide_dir_found.stdout | length > 0
+        - openide_dir_found.stdout != "{{ opt_dir }}/openide"
 
     - name: Ярлык OpenIDE в бинарях
       ansible.builtin.file:
@@ -279,7 +280,7 @@
 
     - name: Репозиторий Docker
       ansible.builtin.apt_repository:
-        repo: "deb [arch={{ ansible_architecture == 'x86_64' | ternary('amd64', ansible_architecture) }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        repo: "deb [arch={{ (ansible_architecture == 'x86_64') | ternary('amd64', (ansible_architecture == 'aarch64') | ternary('arm64', ansible_architecture)) }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         filename: docker
         state: present
         update_cache: true
@@ -324,7 +325,7 @@
       ansible.builtin.command: ubuntu-drivers install
       when: nvidia_check.stdout | length > 0
       register: nvidia_install
-      changed_when: "'no drivers found' not in nvidia_install.stdout"
+      changed_when: "'no drivers found' not in nvidia_install.stdout and nvidia_install.stdout | length > 0"
       notify: reboot-required-notice
 
     - name: Установить CUDA toolkit из официальных репозиториев Ubuntu 26.04
@@ -414,7 +415,7 @@
         HOME: "{{ dev_home }}"
       when: install_hermes_agent
       register: hermes_install
-      changed_when: "'already installed' not in hermes_install.stdout"
+      changed_when: "'already installed' not in hermes_install.stdout and 'is already' not in hermes_install.stdout"
 
   post_tasks:
     - name: Итог
