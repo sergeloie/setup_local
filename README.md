@@ -5,7 +5,7 @@ Ansible-плейбук для автоматической настройки Ub
 ## Быстрый запуск (одной командой)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-repo/setup_local/main/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sergeloie/setup_local/main/setup.sh | bash
 ```
 
 Скрипт автоматически:
