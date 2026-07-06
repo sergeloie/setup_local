@@ -1,0 +1,425 @@
+---
+# ==============================================================================
+# playbook.yml — настройка рабочей станции разработчика на Ubuntu 26.04 LTS
+# (Java-разработка + локальные нейросети)
+#
+# Запуск (локально, на этой же машине):
+#   ansible-playbook -i localhost, -c local playbook.yml -K
+#   -K запросит sudo-пароль (нужен для apt/докера/драйверов)
+#
+# Проверено на: Ubuntu 26.04 LTS "Resolute Raccoon"
+# ==============================================================================
+
+- name: Настройка Java/AI dev-окружения на Ubuntu 26.04
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    # ---- пользователь, для которого ставим GUI-приложения и dotfiles ----
+    # По умолчанию берём того, кто реально запустил ansible (до sudo).
+    dev_user: "{{ lookup('env', 'SUDO_USER') | default(lookup('env', 'USER'), true) }}"
+    dev_home: "/home/{{ dev_user }}"
+
+    # ---- версии/переключатели: поправь при необходимости ----
+    liberica_jdk_version: "25"          # bellsoft-java25-full
+    gradle_version: "9.6.1"             # проверить актуальную: https://gradle.org/releases/
+    jmeter_version: "5.6.3"             # проверить: https://jmeter.apache.org/download_jmeter.cgi
+    node_setup_stream: "setup_lts.x"    # NodeSource: setup_lts.x = текущий LTS
+
+    # OpenIDE (аналог IntelliJ IDEA CE): узнать актуальный билд можно на
+    # https://openide.ru/download/ (кнопка "Linux x86_64 (tar.gz)")
+    openide_build: "253.28294.334.7"
+    openide_url: "https://download.openide.ru/{{ openide_build }}/openIDE-{{ openide_build }}.tar.gz"
+
+    # что ставим из нейросетевых инструментов
+    install_ollama: true       # локальный сервер моделей (рекомендуется для headless/GPU use)
+    install_lmstudio: false    # GUI-приложение, поставь true если хочешь его вместо/вместе с Ollama
+    install_hermes_agent: true # https://hermes-agent.nousresearch.com
+
+    # каталоги установки
+    opt_dir: "/opt"
+
+  handlers:
+    - name: reboot-required-notice
+      debug:
+        msg: >
+          Похоже, нужна перезагрузка (обычно после установки/обновления
+          драйверов NVIDIA или ядра). Выполни `sudo reboot`, когда будет удобно.
+
+  tasks:
+    # --------------------------------------------------------------------
+    # 0. Базовая система
+    # --------------------------------------------------------------------
+    - name: Обновить кэш apt
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Установить базовые пакеты
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - wget
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+          - software-properties-common
+          - build-essential
+          - unzip
+          - zip
+          - tar
+          - htop
+          - net-tools
+          - python3-pip
+          - python3-venv
+        state: present
+
+    - name: Установить Git и git-lfs
+      ansible.builtin.apt:
+        name:
+          - git
+          - git-lfs
+        state: present
+
+    - name: Установить KeePassXC
+      ansible.builtin.apt:
+        name: keepassxc
+        state: present
+
+    # --------------------------------------------------------------------
+    # 1. Liberica JDK 25 (репозиторий BellSoft)
+    # --------------------------------------------------------------------
+    - name: Добавить GPG-ключ BellSoft
+      ansible.builtin.get_url:
+        url: https://download.bell-sw.com/pki/GPG-KEY-bellsoft
+        dest: /etc/apt/keyrings/bellsoft.asc
+        mode: "0644"
+      register: bellsoft_key
+
+    - name: Подключить репозиторий BellSoft
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/bellsoft.asc arch=amd64] https://apt.bell-sw.com/ stable main"
+        filename: bellsoft
+        state: present
+        update_cache: true
+
+    - name: Установить Liberica JDK {{ liberica_jdk_version }} (full, с JavaFX)
+      ansible.builtin.apt:
+        name: "bellsoft-java{{ liberica_jdk_version }}-full"
+        state: present
+        update_cache: true
+
+    - name: Сделать Liberica JDK средой по умолчанию (update-alternatives)
+      ansible.builtin.shell: |
+        set -e
+        JAVA_BIN=$(update-alternatives --list java | grep -i bellsoft | head -n1)
+        if [ -n "$JAVA_BIN" ]; then
+          update-alternatives --set java "$JAVA_BIN"
+        fi
+      changed_when: false
+
+    - name: Прописать JAVA_HOME глобально
+      ansible.builtin.copy:
+        dest: /etc/profile.d/java-home.sh
+        mode: "0644"
+        content: |
+          export JAVA_HOME=/usr/lib/jvm/bellsoft-java{{ liberica_jdk_version }}-full-amd64
+          export PATH="$JAVA_HOME/bin:$PATH"
+
+    # --------------------------------------------------------------------
+    # 2. Gradle (официальный дистрибутив, без обёрток дистрибутива)
+    # --------------------------------------------------------------------
+    - name: Скачать Gradle {{ gradle_version }}
+      ansible.builtin.get_url:
+        url: "https://services.gradle.org/distributions/gradle-{{ gradle_version }}-bin.zip"
+        dest: "/tmp/gradle-{{ gradle_version }}-bin.zip"
+        mode: "0644"
+
+    - name: Распаковать Gradle в {{ opt_dir }}
+      ansible.builtin.unarchive:
+        src: "/tmp/gradle-{{ gradle_version }}-bin.zip"
+        dest: "{{ opt_dir }}"
+        remote_src: true
+        creates: "{{ opt_dir }}/gradle-{{ gradle_version }}"
+
+    - name: Симлинк {{ opt_dir }}/gradle -> текущая версия
+      ansible.builtin.file:
+        src: "{{ opt_dir }}/gradle-{{ gradle_version }}"
+        dest: "{{ opt_dir }}/gradle"
+        state: link
+        force: true
+
+    - name: PATH для Gradle
+      ansible.builtin.copy:
+        dest: /etc/profile.d/gradle-home.sh
+        mode: "0644"
+        content: |
+          export GRADLE_HOME={{ opt_dir }}/gradle
+          export PATH="$GRADLE_HOME/bin:$PATH"
+
+    # --------------------------------------------------------------------
+    # 3. OpenIDE (IDE на базе IntelliJ IDEA CE)
+    # --------------------------------------------------------------------
+    - name: Скачать OpenIDE (build {{ openide_build }})
+      ansible.builtin.get_url:
+        url: "{{ openide_url }}"
+        dest: "/tmp/openide.tar.gz"
+        mode: "0644"
+
+    - name: Распаковать OpenIDE в {{ opt_dir }}/openide
+      ansible.builtin.unarchive:
+        src: "/tmp/openide.tar.gz"
+        dest: "{{ opt_dir }}"
+        remote_src: true
+        creates: "{{ opt_dir }}/openide"
+      register: openide_extract
+
+    - name: Найти реальную папку после распаковки (openIDE-*)
+      ansible.builtin.shell: "ls -d {{ opt_dir }}/openIDE-* 2>/dev/null | head -n1"
+      register: openide_dir_found
+      changed_when: false
+      failed_when: false
+
+    - name: Переименовать в {{ opt_dir }}/openide (если ещё не переименовано)
+      ansible.builtin.command: "mv {{ openide_dir_found.stdout }} {{ opt_dir }}/openide"
+      when:
+        - openide_dir_found.stdout is defined
+        - openide_dir_found.stdout | length > 0
+
+    - name: Ярлык OpenIDE в бинарях
+      ansible.builtin.file:
+        src: "{{ opt_dir }}/openide/bin/openide.sh"
+        dest: /usr/local/bin/openide
+        state: link
+        force: true
+      ignore_errors: true
+
+    - name: Desktop-файл для OpenIDE
+      ansible.builtin.copy:
+        dest: /usr/share/applications/openide.desktop
+        mode: "0644"
+        content: |
+          [Desktop Entry]
+          Name=OpenIDE
+          Exec={{ opt_dir }}/openide/bin/openide.sh %f
+          Icon={{ opt_dir }}/openide/bin/openide.svg
+          Type=Application
+          Categories=Development;IDE;
+          Terminal=false
+
+    # --------------------------------------------------------------------
+    # 4. Bruno (API-клиент)
+    # --------------------------------------------------------------------
+    - name: GPG-ключ Bruno
+      ansible.builtin.shell: |
+        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x9FA6017ECABE0266" \
+          | gpg --dearmor > /etc/apt/keyrings/bruno.gpg
+      args:
+        creates: /etc/apt/keyrings/bruno.gpg
+
+    - name: Права на ключ Bruno
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/bruno.gpg
+        mode: "0644"
+
+    - name: Репозиторий Bruno
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/bruno.gpg] http://debian.usebruno.com/ bruno stable"
+        filename: bruno
+        state: present
+        update_cache: true
+
+    - name: Установить Bruno
+      ansible.builtin.apt:
+        name: bruno
+        state: present
+
+    # --------------------------------------------------------------------
+    # 5. Apache JMeter
+    # --------------------------------------------------------------------
+    - name: Скачать Apache JMeter {{ jmeter_version }}
+      ansible.builtin.get_url:
+        url: "https://dlcdn.apache.org/jmeter/binaries/apache-jmeter-{{ jmeter_version }}.tgz"
+        dest: "/tmp/apache-jmeter-{{ jmeter_version }}.tgz"
+        mode: "0644"
+
+    - name: Распаковать JMeter в {{ opt_dir }}
+      ansible.builtin.unarchive:
+        src: "/tmp/apache-jmeter-{{ jmeter_version }}.tgz"
+        dest: "{{ opt_dir }}"
+        remote_src: true
+        creates: "{{ opt_dir }}/apache-jmeter-{{ jmeter_version }}"
+
+    - name: Симлинк {{ opt_dir }}/jmeter -> текущая версия
+      ansible.builtin.file:
+        src: "{{ opt_dir }}/apache-jmeter-{{ jmeter_version }}"
+        dest: "{{ opt_dir }}/jmeter"
+        state: link
+        force: true
+
+    - name: PATH для JMeter
+      ansible.builtin.copy:
+        dest: /etc/profile.d/jmeter-home.sh
+        mode: "0644"
+        content: |
+          export JMETER_HOME={{ opt_dir }}/jmeter
+          export PATH="$JMETER_HOME/bin:$PATH"
+
+    # --------------------------------------------------------------------
+    # 6. Docker CE (официальный репозиторий; на 26.04 codename = resolute)
+    # --------------------------------------------------------------------
+    - name: GPG-ключ Docker
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Репозиторий Docker
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture == 'x86_64' | ternary('amd64', ansible_architecture) }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Установить Docker CE и плагины
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Включить и запустить Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Добавить пользователя {{ dev_user }} в группу docker
+      ansible.builtin.user:
+        name: "{{ dev_user }}"
+        groups: docker
+        append: true
+
+    # --------------------------------------------------------------------
+    # 7. NVIDIA-драйверы (в 26.04 доступны прямо из официальных репозиториев)
+    # --------------------------------------------------------------------
+    - name: Проверить наличие NVIDIA GPU
+      ansible.builtin.shell: "lspci | grep -i nvidia || true"
+      register: nvidia_check
+      changed_when: false
+
+    - name: Установить ubuntu-drivers-common
+      ansible.builtin.apt:
+        name: ubuntu-drivers-common
+        state: present
+      when: nvidia_check.stdout | length > 0
+
+    - name: Поставить рекомендованный NVIDIA-драйвер (ubuntu-drivers autoinstall)
+      ansible.builtin.command: ubuntu-drivers install
+      when: nvidia_check.stdout | length > 0
+      register: nvidia_install
+      changed_when: "'no drivers found' not in nvidia_install.stdout"
+      notify: reboot-required-notice
+
+    - name: Установить CUDA toolkit из официальных репозиториев Ubuntu 26.04
+      ansible.builtin.apt:
+        name: nvidia-cuda-toolkit
+        state: present
+      when: nvidia_check.stdout | length > 0
+      ignore_errors: true  # имя пакета может отличаться — проверь `apt search cuda`, если упадёт
+
+    # --------------------------------------------------------------------
+    # 8. Miniconda
+    # --------------------------------------------------------------------
+    - name: Скачать установщик Miniconda
+      ansible.builtin.get_url:
+        url: https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+        dest: /tmp/miniconda.sh
+        mode: "0755"
+
+    - name: Установить Miniconda в {{ dev_home }}/miniconda3
+      ansible.builtin.command: "bash /tmp/miniconda.sh -b -p {{ dev_home }}/miniconda3"
+      args:
+        creates: "{{ dev_home }}/miniconda3"
+      become: true
+      become_user: "{{ dev_user }}"
+
+    - name: Инициализировать conda для bash (у пользователя)
+      ansible.builtin.shell: "{{ dev_home }}/miniconda3/bin/conda init bash"
+      become: true
+      become_user: "{{ dev_user }}"
+      args:
+        creates: "{{ dev_home }}/.condarc"
+
+    # --------------------------------------------------------------------
+    # 9. Node.js (через NodeSource)
+    # --------------------------------------------------------------------
+    - name: Скачать NodeSource setup-скрипт
+      ansible.builtin.get_url:
+        url: "https://deb.nodesource.com/{{ node_setup_stream }}"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+
+    - name: Подключить репозиторий Node.js
+      ansible.builtin.command: bash /tmp/nodesource_setup.sh
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Установить Node.js и npm
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+    # --------------------------------------------------------------------
+    # 10. Ollama и/или LM Studio (локальные нейросети)
+    # --------------------------------------------------------------------
+    - name: Установить Ollama (официальный скрипт)
+      ansible.builtin.shell: "curl -fsSL https://ollama.com/install.sh | sh"
+      args:
+        creates: /usr/local/bin/ollama
+      when: install_ollama
+
+    - name: Добавить {{ dev_user }} в группу ollama (если создана)
+      ansible.builtin.user:
+        name: "{{ dev_user }}"
+        groups: ollama
+        append: true
+      when: install_ollama
+      ignore_errors: true
+
+    - name: Скачать LM Studio (AppImage)
+      ansible.builtin.get_url:
+        url: "https://installers.lmstudio.ai/linux/x64/latest/LM-Studio.AppImage"
+        dest: "{{ dev_home }}/Applications/LM-Studio.AppImage"
+        mode: "0755"
+      when: install_lmstudio
+      become: true
+      become_user: "{{ dev_user }}"
+
+    # --------------------------------------------------------------------
+    # 11. Hermes Agent (Nous Research) — ставим от имени пользователя, не root
+    # --------------------------------------------------------------------
+    - name: Установить Hermes Agent
+      ansible.builtin.shell: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+      become: true
+      become_user: "{{ dev_user }}"
+      environment:
+        HOME: "{{ dev_home }}"
+      when: install_hermes_agent
+      register: hermes_install
+      changed_when: "'already installed' not in hermes_install.stdout"
+
+  post_tasks:
+    - name: Итог
+      ansible.builtin.debug:
+        msg: >
+          Готово. Открой новый терминал (или `source /etc/profile`), чтобы
+          подхватились JAVA_HOME/GRADLE_HOME/JMETER_HOME/PATH. Если ставились
+          NVIDIA-драйверы — перезагрузись перед использованием GPU в Docker/Ollama.
